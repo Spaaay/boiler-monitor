@@ -35,4 +35,4 @@ jobs:
           TUYA_DEVICE_ID: ${{ secrets.TUYA_DEVICE_ID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          VOLTAGE_THRESHOLD: "300"
+          VOLTAGE_THRESHOLD: "100"
