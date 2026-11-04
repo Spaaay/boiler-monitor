@@ -24,6 +24,10 @@ TUYA_ACCESS_SECRET = os.environ["TUYA_ACCESS_SECRET"]
 TUYA_DEVICE_ID = os.environ["TUYA_DEVICE_ID"]
 TUYA_SWITCH_CODE = os.environ.get("TUYA_SWITCH_CODE", "switch_1")
 
+# ================= TELEGRAM (необов'язково) =================
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+
 # ================= ЛОГІКА =================
 VOLTAGE_THRESHOLD = float(os.environ.get("VOLTAGE_THRESHOLD", "100"))
 
@@ -32,6 +36,20 @@ KYIV = timezone(timedelta(hours=2))
 
 def log(msg: str) -> None:
     print(f"[{datetime.now(KYIV).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def notify(text: str) -> None:
+    """Повідомлення в Telegram. Якщо токен/чат не задані — мовчки пропускаємо."""
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=10,
+        ).raise_for_status()
+    except Exception as e:  # сповіщення не має валити основну логіку
+        log(f"⚠️ Telegram: {e}")
 
 
 def get_deye_token() -> str:
@@ -97,9 +115,11 @@ def main() -> int:
     if not grid_ok and socket_on:
         log("‼️ Мережа зникла — вимикаємо розетку")
         set_socket(cloud, False)
+        notify(f"🔴 Світло зникло\nНапруга: {voltage} В, АКБ: {soc}%\nБойлер вимкнено")
     elif grid_ok and not socket_on:
         log("💡 Мережа є — вмикаємо розетку")
         set_socket(cloud, True)
+        notify(f"🟢 Світло повернулось\nНапруга: {voltage} В, АКБ: {soc}%\nБойлер увімкнено")
     else:
         log("Змін не потрібно")
     return 0
