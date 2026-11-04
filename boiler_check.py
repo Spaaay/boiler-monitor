@@ -2,6 +2,7 @@
 вмикає/вимикає розетку за потреби й виходить. Запускається з GitHub Actions cron.
 Усі секрети — з env-змінних (GitHub Secrets)."""
 
+import json
 import os
 import sys
 from datetime import datetime, timezone, timedelta
@@ -30,12 +31,27 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
 # ================= ЛОГІКА =================
 VOLTAGE_THRESHOLD = float(os.environ.get("VOLTAGE_THRESHOLD", "100"))
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")  # пам'ять між запусками, комітиться в репо
 
 KYIV = timezone(timedelta(hours=2))
 
 
 def log(msg: str) -> None:
     print(f"[{datetime.now(KYIV).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+        f.write("\n")
 
 
 def notify(text: str) -> None:
@@ -110,18 +126,47 @@ def main() -> int:
     cloud = tuya_cloud()
     socket_on = get_socket_state(cloud)
 
-    log(f"Напруга: {voltage}V | АКБ: {soc}% | Розетка: {'ON' if socket_on else 'OFF'}")
+    state = load_state()
+    prev_grid_ok = state.get("grid_ok")  # None, якщо перший запуск
+    manual_warned = bool(state.get("manual_warned"))
 
-    if not grid_ok and socket_on:
+    log(f"Напруга: {voltage}V | АКБ: {soc}% | Розетка: {'ON' if socket_on else 'OFF'} "
+        f"| Мережа: {'є' if grid_ok else 'нема'} (було: {prev_grid_ok})")
+
+    # Реагуємо лише на ЗМІНУ стану мережі. Якщо мережа як була, так і є —
+    # розетку не чіпаємо, навіть якщо її перемкнули вручну.
+    if prev_grid_ok is None:
+        log("Перший запуск — запам'ятовуємо стан, розетку не чіпаємо")
+    elif prev_grid_ok and not grid_ok:
         log("‼️ Мережа зникла — вимикаємо розетку")
-        set_socket(cloud, False)
+        if socket_on:
+            set_socket(cloud, False)
+            socket_on = False
         notify(f"🔴 Світло зникло\nНапруга: {voltage} В, АКБ: {soc}%\nБойлер вимкнено")
-    elif grid_ok and not socket_on:
-        log("💡 Мережа є — вмикаємо розетку")
-        set_socket(cloud, True)
+    elif not prev_grid_ok and grid_ok:
+        log("💡 Мережа повернулась — вмикаємо розетку")
+        if not socket_on:
+            set_socket(cloud, True)
+            socket_on = True
         notify(f"🟢 Світло повернулось\nНапруга: {voltage} В, АКБ: {soc}%\nБойлер увімкнено")
     else:
         log("Змін не потрібно")
+
+    # Бойлер увімкнули вручну під час блекауту — нагадати один раз.
+    # Прапорець скидається, коли бойлер вимкнуть або повернеться світло.
+    if not grid_ok and socket_on:
+        if not manual_warned:
+            log("⚠️ Бойлер працює від АКБ (ручний режим) — нагадуємо")
+            notify(f"⚠️ Світла нема, а бойлер увімкнений вручну — працює від АКБ.\n"
+                   f"АКБ: {soc}%. Не забудь вимкнути.")
+            manual_warned = True
+    else:
+        manual_warned = False
+
+    new_state = {"grid_ok": grid_ok, "manual_warned": manual_warned}
+    if {k: state.get(k) for k in new_state} != new_state:
+        new_state["updated"] = datetime.now(KYIV).isoformat(timespec="seconds")
+        save_state(new_state)
     return 0
 
 
