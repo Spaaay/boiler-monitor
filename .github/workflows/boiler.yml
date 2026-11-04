@@ -1,0 +1,36 @@
+name: Boiler monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # UTC; мінімум для GitHub — 5 хв
+  workflow_dispatch:        # ручний запуск для тесту
+
+concurrency:
+  group: boiler
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python boiler_check.py
+        env:
+          DEYE_APP_ID: ${{ secrets.DEYE_APP_ID }}
+          DEYE_APP_SECRET: ${{ secrets.DEYE_APP_SECRET }}
+          DEYE_EMAIL: ${{ secrets.DEYE_EMAIL }}
+          DEYE_PASSWORD: ${{ secrets.DEYE_PASSWORD }}
+          DEYE_DEVICE_SN: ${{ secrets.DEYE_DEVICE_SN }}
+          TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
+          TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
+          TUYA_DEVICE_ID: ${{ secrets.TUYA_DEVICE_ID }}
+          VOLTAGE_THRESHOLD: "100"
