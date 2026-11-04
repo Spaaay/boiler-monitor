@@ -70,7 +70,7 @@ def tuya_cloud() -> tinytuya.Cloud:
 def get_socket_state(cloud: tinytuya.Cloud) -> bool:
     status = cloud.getstatus(TUYA_DEVICE_ID)
     if not status.get("success"):
-        raise RuntimeError(f"Tuya status: {status.get('msg')}")
+        raise RuntimeError(f"Tuya status: {status}")
     for dp in status.get("result", []):
         if dp.get("code") == TUYA_SWITCH_CODE:
             return bool(dp.get("value"))
@@ -80,7 +80,7 @@ def get_socket_state(cloud: tinytuya.Cloud) -> bool:
 def set_socket(cloud: tinytuya.Cloud, turn_on: bool) -> None:
     res = cloud.sendcommand(TUYA_DEVICE_ID, {"commands": [{"code": TUYA_SWITCH_CODE, "value": turn_on}]})
     if not res.get("success"):
-        raise RuntimeError(f"Tuya command: {res.get('msg')}")
+        raise RuntimeError(f"Tuya command: {res}")
     log(f"✅ Розетка {'увімкнена' if turn_on else 'вимкнена'}")
 
 
