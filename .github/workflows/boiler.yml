@@ -2,7 +2,7 @@ name: Boiler monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # UTC; мінімум для GitHub — 5 хв
+    - cron: "2-57/5 * * * *" # UTC; мінімум для GitHub — 5 хв
   workflow_dispatch:        # ручний запуск для тесту
 
 concurrency:
