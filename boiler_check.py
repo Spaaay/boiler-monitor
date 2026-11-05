@@ -27,7 +27,8 @@ TUYA_SWITCH_CODE = os.environ.get("TUYA_SWITCH_CODE", "switch_1")
 
 # ================= TELEGRAM (необов'язково) =================
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+# один chat_id або кілька через кому: "317300041,693765287"
+TG_CHAT_IDS = [c.strip() for c in os.environ.get("TG_CHAT_ID", "").split(",") if c.strip()]
 
 # ================= ЛОГІКА =================
 VOLTAGE_THRESHOLD = float(os.environ.get("VOLTAGE_THRESHOLD", "100"))
@@ -56,16 +57,17 @@ def save_state(state: dict) -> None:
 
 def notify(text: str) -> None:
     """Повідомлення в Telegram. Якщо токен/чат не задані — мовчки пропускаємо."""
-    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+    if not (TG_BOT_TOKEN and TG_CHAT_IDS):
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text},
-            timeout=10,
-        ).raise_for_status()
-    except Exception as e:  # сповіщення не має валити основну логіку
-        log(f"⚠️ Telegram: {e}")
+    for chat_id in TG_CHAT_IDS:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=10,
+            ).raise_for_status()
+        except Exception as e:  # сповіщення не має валити основну логіку
+            log(f"⚠️ Telegram ({chat_id}): {e}")
 
 
 def get_deye_token() -> str:
