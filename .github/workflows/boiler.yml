@@ -15,7 +15,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +42,8 @@ jobs:
           GRID_POWER_MAX_KW: "2.5"
           CHARGE_A_NORMAL: "80"
           CHARGE_A_ECO: "40"
+          SOC_BOILER_OK: "90"
+          DEYE_READ_TIMEOUT_S: "60"
 
       - name: Save state
         run: |
