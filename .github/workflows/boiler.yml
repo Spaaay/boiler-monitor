@@ -15,7 +15,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +39,9 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           VOLTAGE_THRESHOLD: "100"
+          GRID_POWER_MAX_KW: "2.5"
+          CHARGE_A_NORMAL: "80"
+          CHARGE_A_ECO: "40"
 
       - name: Save state
         run: |
