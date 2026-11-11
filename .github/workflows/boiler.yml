@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main   # завжди актуальний state.json, а не SHA на момент постановки в чергу
 
       - uses: actions/setup-python@v5
         with:
