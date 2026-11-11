@@ -1,6 +1,17 @@
 """One-shot перевірка: читає стан інвертора Deye і розетки Tuya, керує бойлером,
 шле сповіщення й обробляє кнопки в Telegram. Запускається кожні 5 хв (GitHub Actions).
-Усі секрети — з env (GitHub Secrets). Пам'ять між запусками — state.json у репо."""
+Усі секрети — з env (GitHub Secrets). Пам'ять між запусками — state.json у репо.
+
+Правила:
+  Світло зникло      → бойлер OFF, якщо був режим 40 А — повернути 80 А.
+  Світло повернулось → читаємо налаштування заряду з інвертора.
+                       BMS ріже заряд (ліміт < 80 А при SOC < 90) або SOC ≥ 90 → бойлер ON.
+                       Інакше → бойлер OFF. В обох випадках — кнопки.
+  Далі кожні 5 хв    → бойлер OFF і SOC став ≥ 90 → бойлер ON + кнопки (один раз).
+                       режим 40 А і мережа < GRID_POWER_MAX_KW → 80 А + кнопки.
+  Кнопки (будь-коли, поки є світло):
+     🔋 40 А + бойлер ON       ⚡ 80 А + бойлер OFF
+"""
 
 import json
 import os
@@ -26,21 +37,18 @@ TUYA_ACCESS_SECRET = os.environ["TUYA_ACCESS_SECRET"]
 TUYA_DEVICE_ID = os.environ["TUYA_DEVICE_ID"]
 TUYA_SWITCH_CODE = os.environ.get("TUYA_SWITCH_CODE", "switch_1")
 
-# ================= TELEGRAM (необов'язково) =================
+# ================= TELEGRAM =================
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-# один chat_id або кілька через кому: "317300041,693765287"
 TG_CHAT_IDS = [c.strip() for c in os.environ.get("TG_CHAT_ID", "").split(",") if c.strip()]
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ================= ЛОГІКА =================
 VOLTAGE_THRESHOLD = float(os.environ.get("VOLTAGE_THRESHOLD", "100"))
-# Вмикати бойлер лише коли споживання з мережі (без бойлера) нижче цього, кВт.
-# Автомат 20 А ≈ 4.4 кВт; бойлер в еко ≈ 1.5 кВт → 2.5 + 1.5 = 4.0 кВт, є запас.
-GRID_POWER_MAX_KW = float(os.environ.get("GRID_POWER_MAX_KW", "2.5"))
-# Струм заряду АКБ від мережі (gridChargeAmpere): звичайний і "економ" для кнопки 🔋
+GRID_POWER_MAX_KW = float(os.environ.get("GRID_POWER_MAX_KW", "2.5"))  # поріг повернення 40 → 80 А
 CHARGE_A_NORMAL = int(os.environ.get("CHARGE_A_NORMAL", "80"))
 CHARGE_A_ECO = int(os.environ.get("CHARGE_A_ECO", "40"))
-# Еко-режим (40 А + бойлер) знімаємо, коли споживання з мережі впаде нижче GRID_POWER_MAX_KW
+SOC_BOILER_OK = float(os.environ.get("SOC_BOILER_OK", "90"))  # SOC, від якого бойлер вмикається сам
+DEYE_READ_TIMEOUT_S = int(os.environ.get("DEYE_READ_TIMEOUT_S", "60"))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 KYIV = timezone(timedelta(hours=2))
@@ -88,13 +96,13 @@ def notify(text: str, buttons: bool = False) -> list:
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": [[
             {"text": f"🔋 {CHARGE_A_ECO} А + бойлер", "callback_data": CB_ECO},
-            {"text": f"⚡ {CHARGE_A_NORMAL} А без бойлера", "callback_data": CB_FULL},
+            {"text": f"⚡ {CHARGE_A_NORMAL} А, бойлер OFF", "callback_data": CB_FULL},
         ]]}
     for chat_id in TG_CHAT_IDS:
         try:
             m = tg("sendMessage", chat_id=chat_id, **payload)
             sent.append((chat_id, m["message_id"]))
-        except Exception as e:  # сповіщення не має валити основну логіку
+        except Exception as e:
             log(f"⚠️ Telegram ({chat_id}): {e}")
     return sent
 
@@ -109,7 +117,7 @@ def remove_buttons(msgs: list) -> None:
 
 
 def poll_buttons(state: dict) -> str | None:
-    """Забирає натискання кнопок з моменту останнього запуску. Повертає останнє (eco/full)."""
+    """Натискання кнопок з моменту останнього запуску. Повертає останнє (eco/full)."""
     if not (TG_BOT_TOKEN and TG_CHAT_IDS):
         return None
     try:
@@ -167,19 +175,49 @@ def get_inverter_data(token: str) -> dict:
             for item in d["deviceDataList"][0].get("dataList", [])}
 
 
+def read_grid_charge_ampere(token: str) -> int | None:
+    """Живе читання gridChargeAmpere з інвертора. Чекає до DEYE_READ_TIMEOUT_S, None при таймауті."""
+    deadline = time.time() + DEYE_READ_TIMEOUT_S
+    try:
+        while True:
+            d = deye("POST", "/strategy/dynamicControl/read", {"deviceSn": DEYE_DEVICE_SN}, token)
+            if str(d.get("code")) == "2104004" and time.time() < deadline:  # інвертор зайнятий
+                time.sleep(3)
+                continue
+            break
+        order_id = d.get("orderId")
+        if not order_id:
+            log(f"⚠️ Deye dynamicControl/read: {d.get('msg')}")
+            return None
+        time.sleep(4)
+        while time.time() < deadline:
+            r = deye("POST", "/strategy/dynamicControl/readResult", {"orderId": order_id}, token)
+            if str(r.get("code")) in ("2104013", "2104004"):
+                time.sleep(2)
+                continue
+            if r.get("success") and r.get("gridChargeAmpere") is not None:
+                return int(r["gridChargeAmpere"])
+            log(f"⚠️ Deye readResult: {r.get('msg')}")
+            return None
+        log(f"⚠️ Deye readResult: таймаут {DEYE_READ_TIMEOUT_S} с")
+    except Exception as e:
+        log(f"⚠️ Deye read: {e}")
+    return None
+
+
 def set_grid_charge_ampere(token: str, amps: int) -> None:
     """Міняє gridChargeAmpere і чекає підтвердження інвертора (статус 666)."""
     for _ in range(10):
         d = deye("POST", "/order/battery/parameter/update",
                  {"deviceSn": DEYE_DEVICE_SN, "paramterType": "GRID_CHARGE_AMPERE", "value": amps}, token)
-        if str(d.get("code")) == "2104004":  # інвертор виконує попередню команду
+        if str(d.get("code")) == "2104004":
             time.sleep(3)
             continue
         break
     order_id = d.get("orderId")
     if not order_id:
         raise RuntimeError(f"Deye order: {d.get('msg')}")
-    for _ in range(15):
+    for _ in range(20):
         s = deye("GET", f"/order/{order_id}", None, token)
         status = str(s.get("status"))
         if status == "666":
@@ -189,6 +227,13 @@ def set_grid_charge_ampere(token: str, amps: int) -> None:
             raise RuntimeError(f"Deye order {order_id} failed: {s}")
         time.sleep(2)
     raise RuntimeError(f"Deye order {order_id} timeout")
+
+
+def _num(d: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(d.get(key, (default, ""))[0])
+    except (TypeError, ValueError):
+        return default
 
 
 def _kw(d: dict, *keys: str) -> float | None:
@@ -204,15 +249,24 @@ def _kw(d: dict, *keys: str) -> float | None:
 
 class Metrics:
     def __init__(self, d: dict):
-        self.voltage = float(d.get("GridVoltageL1L2", (0, ""))[0] or 0)
-        self.soc = d.get("SOC", ("N/A", ""))[0]
-        self.grid_kw = _kw(d, "TotalGridPower", "GridPower")
-        self.load_kw = _kw(d, "UPSLoadPower", "TotalLoadPower", "LoadPower")
-        self.batt_kw = _kw(d, "BatteryPower", "TotalBatteryPower", "BatteryChargePower")
+        self.voltage = _num(d, "GridVoltageL1L2")
+        self.soc = _num(d, "SOC")
+        self.grid_kw = _kw(d, "TotalGridPower")
+        self.load_kw = _kw(d, "UPSLoadPower", "TotalConsumptionPower")
+        self.batt_kw = _kw(d, "BatteryPower")
+        self.batt_v = _num(d, "BatteryVoltage", 52)
+        self.batt_temp = _num(d, "BMSTemperature")
+        self.bms_limit_a = _num(d, "ChargeCurrentLimit")  # ліміт заряду від BMS, 0 = невідомо
+        self.charge_a: int | None = None                  # gridChargeAmpere (налаштування інвертора)
 
     @property
     def grid_import_kw(self) -> float:
         return max(0.0, self.grid_kw or 0.0)
+
+    @property
+    def bms_limits(self) -> bool:
+        """BMS не дає зарядити на повну (холодна АКБ), хоча заряд ще далеко не закінчився."""
+        return 0 < self.bms_limit_a < CHARGE_A_NORMAL and self.soc < SOC_BOILER_OK
 
     def status(self) -> str:
         def f(v):
@@ -220,7 +274,12 @@ class Metrics:
         batt = ""
         if self.batt_kw is not None:
             batt = f" ({'заряд' if self.batt_kw < 0 else 'розряд'} {abs(self.batt_kw):.1f} кВт)"
-        return f"Мережа: {f(self.grid_kw)} | Навантаження: {f(self.load_kw)} | АКБ: {self.soc}%{batt}"
+        charge = f"{self.charge_a} А" if self.charge_a is not None else "?"
+        if self.bms_limits:
+            charge += f" (BMS обмежує до {self.bms_limit_a:.0f} А)"
+        return (f"Мережа: {f(self.grid_kw)} | Будинок: {f(self.load_kw)}\n"
+                f"АКБ: {self.soc:.0f}%{batt}, {self.batt_temp:.0f} °C\n"
+                f"Заряд: {charge}")
 
 
 # ================= TUYA =================
@@ -236,7 +295,7 @@ def get_socket(cloud: tinytuya.Cloud) -> tuple[bool, float]:
     dps = {dp.get("code"): dp.get("value") for dp in status.get("result", [])}
     if TUYA_SWITCH_CODE not in dps:
         raise RuntimeError(f"Tuya: не знайдено dp '{TUYA_SWITCH_CODE}' у {dps}")
-    return bool(dps[TUYA_SWITCH_CODE]), float(dps.get("cur_power") or 0) / 10  # cur_power у 0.1 Вт
+    return bool(dps[TUYA_SWITCH_CODE]), float(dps.get("cur_power") or 0) / 10
 
 
 def set_socket(cloud: tinytuya.Cloud, turn_on: bool) -> None:
@@ -251,7 +310,6 @@ def main() -> int:
     token = get_deye_token()
     m = Metrics(get_inverter_data(token))
     grid_ok = m.voltage >= VOLTAGE_THRESHOLD
-    power_ok = m.grid_import_kw <= GRID_POWER_MAX_KW
 
     cloud = tuya_cloud()
     socket_on, socket_w = get_socket(cloud)
@@ -259,123 +317,119 @@ def main() -> int:
     state = load_state()
     prev_grid_ok = state.get("grid_ok")
     manual_warned = bool(state.get("manual_warned"))
-    pending = bool(state.get("boiler_pending"))      # світло є, бойлер чекає, поки спаде заряд
-    pending_msgs = state.get("pending_msgs") or []   # повідомлення з кнопками
-    eco = state.get("eco")                           # {"since": iso} поки струм заряду знижений
-    eco_started_now = False
+    wait_soc = bool(state.get("wait_soc"))      # бойлер OFF, чекаємо SOC ≥ SOC_BOILER_OK
+    eco = state.get("eco")                      # {"since": iso} поки струм заряду 40 А
+    btn_msgs = state.get("btn_msgs") or []      # повідомлення з активними кнопками
+    m.charge_a = state.get("charge_a")          # останнє відоме налаштування заряду
     action = poll_buttons(state)
 
-    log(f"Напруга: {m.voltage}V | {m.status()} | Розетка: {'ON' if socket_on else 'OFF'} {socket_w:.0f} Вт "
-        f"| Мережа: {'є' if grid_ok else 'нема'} (було: {prev_grid_ok}) | pending={pending} eco={bool(eco)}")
+    log(f"Напруга: {m.voltage:.0f}V | SOC {m.soc:.0f}% | {m.batt_temp:.0f}°C | мережа {m.grid_import_kw:.1f} кВт "
+        f"| BMS ліміт {m.bms_limit_a:.0f} А | заряд {m.charge_a} А | розетка {'ON' if socket_on else 'OFF'} "
+        f"{socket_w:.0f} Вт | grid_ok={grid_ok} (було {prev_grid_ok}) wait_soc={wait_soc} eco={bool(eco)}")
 
-    wait_msg = (f"Заряд {CHARGE_A_NORMAL} А. Бойлер увімкну сам, коли мережа впаде нижче "
-                f"{GRID_POWER_MAX_KW:g} кВт (зараз {m.grid_import_kw:.1f}), або обери кнопкою.")
+    def send(text: str, buttons: bool = True) -> None:
+        """Нове повідомлення; кнопки зі старого знімаємо, щоб активні були лише останні."""
+        nonlocal btn_msgs
+        remove_buttons(btn_msgs)
+        btn_msgs = notify(text, buttons=buttons) if buttons else (notify(text), [])[1]
 
-    def start_pending(text: str) -> None:
-        nonlocal pending, pending_msgs
-        pending = True
-        pending_msgs = notify(text, buttons=True)
-
-    def resolve_pending() -> None:
-        nonlocal pending, pending_msgs
-        pending = False
-        remove_buttons(pending_msgs)
-        pending_msgs = []
-
-    def restore_charge(reason: str) -> None:
+    def set_charge(amps: int) -> None:
         nonlocal eco
-        set_grid_charge_ampere(token, CHARGE_A_NORMAL)
-        eco = None
-        notify(f"🔌 Струм заряду повернуто на {CHARGE_A_NORMAL} А — {reason}\n{m.status()}")
+        if m.charge_a != amps:
+            set_grid_charge_ampere(token, amps)
+        m.charge_a = amps
+        eco = {"since": now_iso()} if amps == CHARGE_A_ECO else None
 
-    # ---- зміна стану мережі ----
+    def boiler(on: bool) -> None:
+        nonlocal socket_on
+        if socket_on != on:
+            set_socket(cloud, on)
+            socket_on = on
+
+    # ---------- світло зникло ----------
     if prev_grid_ok is None:
-        log("Перший запуск — запам'ятовуємо стан, розетку не чіпаємо")
+        log("Перший запуск — запам'ятовуємо стан")
+        if m.charge_a is None:
+            m.charge_a = read_grid_charge_ampere(token)
 
     elif prev_grid_ok and not grid_ok:
-        log("‼️ Мережа зникла — вимикаємо розетку")
-        if socket_on:
-            set_socket(cloud, False)
-            socket_on = False
-        if pending:
-            resolve_pending()
+        log("‼️ Мережа зникла")
+        boiler(False)
+        wait_soc = False
         if eco:
-            restore_charge("світло зникло")
-        notify(f"🔴 Світло зникло\n{m.status()}\nБойлер вимкнено")
+            set_charge(CHARGE_A_NORMAL)
+        send(f"🔴 Світло зникло\n{m.status()}\nБойлер вимкнено", buttons=False)
 
+    # ---------- світло повернулось ----------
     elif not prev_grid_ok and grid_ok:
-        log("💡 Мережа повернулась")
-        if socket_on and not power_ok:
-            # бойлер увімкнули вручну під час блекауту, а зараз інвертор заряджає на повну —
-            # разом виб'є автомат. Вимикаємо і ставимо в чергу.
-            set_socket(cloud, False)
-            socket_on = False
-            start_pending(f"🟢 Світло повернулось\n{m.status()}\n"
-                          f"⚠️ Бойлер був увімкнений — вимкнув, щоб не вибило автомат. {wait_msg}")
-        elif socket_on:
-            notify(f"🟢 Світло повернулось\n{m.status()}\nБойлер уже увімкнений")
-        elif power_ok:
-            set_socket(cloud, True)
-            socket_on = True
-            notify(f"🟢 Світло повернулось\n{m.status()}\nБойлер увімкнено")
+        log("💡 Мережа повернулась — читаємо налаштування інвертора")
+        read = read_grid_charge_ampere(token)
+        if read is not None:
+            m.charge_a = read
+            eco = {"since": now_iso()} if read == CHARGE_A_ECO else None
+        elif m.charge_a is None:
+            m.charge_a = CHARGE_A_NORMAL
+        if m.bms_limits:
+            boiler(True)
+            wait_soc = False
+            send(f"🟢 Світло повернулось\n{m.status()}\n"
+                 f"BMS обмежує заряд (АКБ {m.batt_temp:.0f} °C) — бойлер увімкнено")
+        elif m.soc >= SOC_BOILER_OK:
+            boiler(True)
+            wait_soc = False
+            send(f"🟢 Світло повернулось\n{m.status()}\nАКБ ≥ {SOC_BOILER_OK:g}% — бойлер увімкнено")
         else:
-            start_pending(f"🟢 Світло повернулось\n{m.status()}\n⏳ {wait_msg}")
+            was_on = socket_on
+            boiler(False)
+            wait_soc = True
+            note = " (був увімкнений вручну — вимкнув)" if was_on else ""
+            send(f"🟢 Світло повернулось\n{m.status()}\n"
+                 f"Бойлер вимкнено{note}. Увімкну сам при АКБ ≥ {SOC_BOILER_OK:g}%.")
 
-    # ---- бойлер у черзі ----
-    elif grid_ok and pending:
+    # ---------- світло є ----------
+    elif grid_ok:
         if action == CB_ECO:
-            log(f"🔋 Кнопка: знижуємо заряд до {CHARGE_A_ECO} А і вмикаємо бойлер")
-            set_grid_charge_ampere(token, CHARGE_A_ECO)
-            eco = {"since": now_iso()}
-            eco_started_now = True
-            time.sleep(20)  # дати інвертору скинути потужність
-            set_socket(cloud, True)
-            socket_on = True
-            resolve_pending()
-            notify(f"🔋 Заряд {CHARGE_A_ECO} А, бойлер увімкнено.\n"
-                   f"Поверну {CHARGE_A_NORMAL} А, коли мережа впаде нижче {GRID_POWER_MAX_KW:g} кВт.\n{m.status()}")
+            log("🔘 ECO: 40 А + бойлер")
+            set_charge(CHARGE_A_ECO)
+            time.sleep(15)  # інвертор скидає потужність
+            boiler(True)
+            wait_soc = False
+            send(f"🔋 Заряд {CHARGE_A_ECO} А, бойлер увімкнено.\n"
+                 f"Поверну {CHARGE_A_NORMAL} А, коли мережа < {GRID_POWER_MAX_KW:g} кВт.\n{m.status()}")
         elif action == CB_FULL:
-            log(f"⚡ Кнопка: лишаємо {CHARGE_A_NORMAL} А, бойлер чекає")
-            remove_buttons(pending_msgs)
-            pending_msgs = []
-            notify(f"⚡ Заряд {CHARGE_A_NORMAL} А, бойлер увімкну сам, коли мережа впаде нижче "
-                   f"{GRID_POWER_MAX_KW:g} кВт.")
-        elif socket_on:
-            log("Бойлер увімкнули вручну — чергу знімаємо")
-            resolve_pending()
-        elif power_ok:
-            log("🔥 Споживання спало — вмикаємо бойлер")
-            set_socket(cloud, True)
-            socket_on = True
-            resolve_pending()
-            notify(f"🔥 Бойлер увімкнено\n{m.status()}")
+            log("🔘 FULL: 80 А, бойлер OFF")
+            set_charge(CHARGE_A_NORMAL)
+            boiler(False)
+            wait_soc = m.soc < SOC_BOILER_OK  # вимкнув при SOC ≥ 90 — значить свідомо, більше не вмикаємо
+            tail = (f" Увімкну сам при АКБ ≥ {SOC_BOILER_OK:g}%." if wait_soc
+                    else " До наступного відключення сам не вмикатиму.")
+            send(f"⚡ Заряд {CHARGE_A_NORMAL} А, бойлер вимкнено.{tail}\n{m.status()}")
+        elif wait_soc and m.soc >= SOC_BOILER_OK:
+            log("🔥 SOC досяг порогу — вмикаємо бойлер")
+            boiler(True)
+            wait_soc = False
+            send(f"🔥 АКБ {m.soc:.0f}% — бойлер увімкнено\n{m.status()}")
+        elif eco and m.grid_import_kw < GRID_POWER_MAX_KW:
+            log("🔌 Мережа розвантажилась — повертаємо 80 А")
+            set_charge(CHARGE_A_NORMAL)
+            send(f"🔌 Мережа {m.grid_import_kw:.1f} кВт < {GRID_POWER_MAX_KW:g} — заряд повернуто на "
+                 f"{CHARGE_A_NORMAL} А\n{m.status()}")
         else:
-            log(f"⏳ Чекаємо: мережа {m.grid_import_kw:.1f} кВт > {GRID_POWER_MAX_KW:g}")
+            log("Змін не потрібно")
 
+    # ---------- світла нема ----------
     else:
-        log("Змін не потрібно")
         if action:
-            notify("Кнопка вже неактуальна — бойлер не в черзі.")
-
-    # ---- еко-режим: повернути струм заряду, коли мережа розвантажилась ----
-    if eco and grid_ok and not eco_started_now:  # щойно натиснуту кнопку не оцінюємо
-        if m.grid_import_kw < GRID_POWER_MAX_KW:
-            restore_charge(f"мережа {m.grid_import_kw:.1f} кВт < {GRID_POWER_MAX_KW:g}")
-        else:
-            log(f"🔋 Еко-режим: мережа {m.grid_import_kw:.1f} кВт, чекаємо < {GRID_POWER_MAX_KW:g}")
-
-    # ---- бойлер увімкнули вручну під час блекауту — нагадати один раз ----
-    if not grid_ok and socket_on:
-        if not manual_warned:
-            log("⚠️ Бойлер працює від АКБ (ручний режим) — нагадуємо")
-            notify(f"⚠️ Світла нема, а бойлер увімкнений вручну — працює від АКБ.\n"
-                   f"{m.status()}\nНе забудь вимкнути.")
+            notify("Світла нема — кнопки неактивні.")
+        if socket_on and not manual_warned:
+            log("⚠️ Бойлер працює від АКБ (ручний режим)")
+            notify(f"⚠️ Світла нема, а бойлер увімкнений вручну — працює від АКБ.\n{m.status()}\nНе забудь вимкнути.")
             manual_warned = True
-    else:
+    if grid_ok or not socket_on:
         manual_warned = False
 
-    new_state = {"grid_ok": grid_ok, "manual_warned": manual_warned, "boiler_pending": pending,
-                 "pending_msgs": pending_msgs, "eco": eco, "tg_offset": state.get("tg_offset", 0)}
+    new_state = {"grid_ok": grid_ok, "manual_warned": manual_warned, "wait_soc": wait_soc, "eco": eco,
+                 "charge_a": m.charge_a, "btn_msgs": btn_msgs, "tg_offset": state.get("tg_offset", 0)}
     if {k: state.get(k) for k in new_state} != new_state:
         new_state["updated"] = now_iso()
         save_state(new_state)
@@ -385,6 +439,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as e:  # падаємо з ненульовим кодом, щоб run був червоним
+    except Exception as e:
         log(f"❌ {e}")
         sys.exit(1)
