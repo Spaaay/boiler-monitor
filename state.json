@@ -1,1 +1,1 @@
-{"grid_ok": true, "manual_warned": false, "wait_soc": false, "eco": null, "charge_a": 80, "btn_msgs": [["317300041", 123], ["693765287", 124]], "tg_offset": 875406708, "updated": "2026-11-14T11:50:36+02:00"}
+{"grid_ok": false, "manual_warned": false, "wait_soc": false, "eco": null, "charge_a": 80, "btn_msgs": [], "tg_offset": 875406708, "updated": "2026-11-14T15:31:01+02:00"}
